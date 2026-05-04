@@ -12,97 +12,110 @@ jobs:
   test-clone-rate-limit:
     runs-on: ubuntu-latest
     steps:
-      - name: Check rate limit BEFORE clone
+      - name: Snapshot rate limit (T0 — baseline)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "=== Rate limit BEFORE clone ==="
-          gh api rate_limit | jq '{
-            core: .resources.core,
-            graphql: .resources.graphql,
-            search: .resources.search
-          }'
-          echo ""
-          echo "--- Core remaining before clone ---"
-          gh api rate_limit | jq '.resources.core.remaining' | tee /tmp/before_core
+          gh api rate_limit | jq '.resources.core' | tee /tmp/t0.json
+          jq '.remaining' /tmp/t0.json | tee /tmp/t0_remaining
 
-      - name: Clone a public repo using GITHUB_TOKEN
+      - name: Make a known API call (control — proves counter moves)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Calling GET /repos/stefanpenner-cs/actor-token-modeling ..."
+          gh api repos/stefanpenner-cs/actor-token-modeling --jq '.full_name'
+
+      - name: Snapshot rate limit (T1 — after control API call)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api rate_limit | jq '.resources.core' | tee /tmp/t1.json
+          jq '.remaining' /tmp/t1.json | tee /tmp/t1_remaining
+
+      - name: Clone repo with GITHUB_TOKEN
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "Cloning with GITHUB_TOKEN via https..."
           git clone https://x-access-token:${GITHUB_TOKEN}@github.com/stefanpenner-cs/actor-token-modeling.git /tmp/clone-test-token
-          echo "Clone with token succeeded"
+          echo "Authenticated clone succeeded"
 
-      - name: Check rate limit AFTER token clone
+      - name: Snapshot rate limit (T2 — after authenticated clone)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "=== Rate limit AFTER token clone ==="
-          gh api rate_limit | jq '{
-            core: .resources.core,
-            graphql: .resources.graphql,
-            search: .resources.search
-          }'
-          echo ""
-          echo "--- Core remaining after token clone ---"
-          gh api rate_limit | jq '.resources.core.remaining' | tee /tmp/after_token_core
+          gh api rate_limit | jq '.resources.core' | tee /tmp/t2.json
+          jq '.remaining' /tmp/t2.json | tee /tmp/t2_remaining
 
-      - name: Clone same repo WITHOUT token (unauthenticated)
+      - name: Clone repo WITHOUT token (unauthenticated)
         run: |
-          echo "Cloning without token (unauthenticated)..."
           git clone https://github.com/stefanpenner-cs/actor-token-modeling.git /tmp/clone-test-notoken
           echo "Unauthenticated clone succeeded"
 
-      - name: Check rate limit AFTER unauthenticated clone
+      - name: Snapshot rate limit (T3 — after unauthenticated clone)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "=== Rate limit AFTER unauthenticated clone ==="
-          gh api rate_limit | jq '{
-            core: .resources.core,
-            graphql: .resources.graphql,
-            search: .resources.search
-          }'
-          echo ""
-          echo "--- Core remaining after unauth clone ---"
-          gh api rate_limit | jq '.resources.core.remaining' | tee /tmp/after_unauth_core
+          gh api rate_limit | jq '.resources.core' | tee /tmp/t3.json
+          jq '.remaining' /tmp/t3.json | tee /tmp/t3_remaining
 
       - name: Compare results
         run: |
-          BEFORE=$(cat /tmp/before_core)
-          AFTER_TOKEN=$(cat /tmp/after_token_core)
-          AFTER_UNAUTH=$(cat /tmp/after_unauth_core)
+          T0=$(cat /tmp/t0_remaining)
+          T1=$(cat /tmp/t1_remaining)
+          T2=$(cat /tmp/t2_remaining)
+          T3=$(cat /tmp/t3_remaining)
 
           echo "=================================="
           echo "  Rate Limit Impact Summary"
           echo "=================================="
           echo ""
-          echo "Core rate limit remaining:"
-          echo "  Before any clone:          $BEFORE"
-          echo "  After token clone:         $AFTER_TOKEN"
-          echo "  After unauthenticated clone: $AFTER_UNAUTH"
+          echo "Core rate limit remaining at each snapshot:"
+          echo "  T0 (baseline):                $T0"
+          echo "  T1 (after control API call):  $T1"
+          echo "  T2 (after token clone):       $T2"
+          echo "  T3 (after unauth clone):      $T3"
           echo ""
-          echo "Consumed by token clone:       $((BEFORE - AFTER_TOKEN))"
-          echo "Consumed by unauth clone:      $((AFTER_TOKEN - AFTER_UNAUTH))"
-          echo "Total consumed:                $((BEFORE - AFTER_UNAUTH))"
+          echo "Delta T0→T1 (control API call): $((T0 - T1))"
+          echo "Delta T1→T2 (token clone):      $((T1 - T2))"
+          echo "Delta T2→T3 (unauth clone):     $((T2 - T3))"
           echo ""
 
-          if [ "$BEFORE" -eq "$AFTER_TOKEN" ]; then
-            echo "RESULT: Token clone did NOT consume any core rate limit"
+          # Validate that the control call moved the counter
+          CONTROL_DELTA=$((T0 - T1))
+          if [ "$CONTROL_DELTA" -le 0 ]; then
+            echo "WARNING: Control API call did not decrement the counter (delta=$CONTROL_DELTA)."
+            echo "The rate limit snapshots may not be reliable."
           else
-            echo "RESULT: Token clone consumed $((BEFORE - AFTER_TOKEN)) core rate limit requests"
+            echo "CONTROL OK: API call consumed $CONTROL_DELTA request(s) — counter is live."
+          fi
+          echo ""
+
+          # Note: each T snapshot itself is an API call to /rate_limit, which
+          # also consumes 1 request. So T1 should be ~2 less than T0 (the
+          # /repos call + the /rate_limit call at T1). The key comparison is
+          # whether the clone adds anything ON TOP of the /rate_limit snapshot call.
+
+          # T1→T2: the only API call between them is the T2 /rate_limit snapshot itself.
+          # If the clone consumed rate limit, delta would be > 1.
+          CLONE_DELTA=$((T1 - T2))
+          echo "Token clone delta: $CLONE_DELTA"
+          if [ "$CLONE_DELTA" -le 1 ]; then
+            echo "RESULT: Token clone did NOT consume core rate limit (delta=$CLONE_DELTA accounts for the snapshot call only)"
+          else
+            echo "RESULT: Token clone consumed $((CLONE_DELTA - 1)) extra core rate limit request(s)"
           fi
 
-          if [ "$AFTER_TOKEN" -eq "$AFTER_UNAUTH" ]; then
-            echo "RESULT: Unauthenticated clone did NOT consume any core rate limit"
+          UNAUTH_DELTA=$((T2 - T3))
+          echo "Unauth clone delta: $UNAUTH_DELTA"
+          if [ "$UNAUTH_DELTA" -le 1 ]; then
+            echo "RESULT: Unauthenticated clone did NOT consume core rate limit (delta=$UNAUTH_DELTA accounts for the snapshot call only)"
           else
-            echo "RESULT: Unauthenticated clone consumed $((AFTER_TOKEN - AFTER_UNAUTH)) core rate limit requests"
+            echo "RESULT: Unauthenticated clone consumed $((UNAUTH_DELTA - 1)) extra core rate limit request(s)"
           fi
 
-      - name: Also check git-specific rate limits
+      - name: Full rate limit dump for reference
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "=== Full rate limit dump for reference ==="
           gh api rate_limit | jq .

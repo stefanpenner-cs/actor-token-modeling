@@ -34,15 +34,24 @@ jobs:
           TOKEN: ${{ steps.oidc.outputs.token }}
         run: |
           echo "=== JWT Header ==="
-          echo "$TOKEN" | cut -d. -f1 | base64 -d 2>/dev/null | jq .
+          HEADER=$(echo "$TOKEN" | cut -d. -f1 | tr '_-' '/+')
+          # Add padding
+          while [ $((${#HEADER} % 4)) -ne 0 ]; do HEADER="${HEADER}="; done
+          echo "$HEADER" | base64 -d | jq .
 
       - name: Decode OIDC token claims (payload)
         env:
           TOKEN: ${{ steps.oidc.outputs.token }}
         run: |
+          decode_jwt_part() {
+            local PART="$1"
+            PART=$(echo "$PART" | tr '_-' '/+')
+            while [ $((${#PART} % 4)) -ne 0 ]; do PART="${PART}="; done
+            echo "$PART" | base64 -d
+          }
+
           echo "=== JWT Claims (full payload) ==="
-          # JWT base64url needs padding normalization
-          PAYLOAD=$(echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null)
+          PAYLOAD=$(decode_jwt_part "$(echo "$TOKEN" | cut -d. -f2)")
           echo "$PAYLOAD" | jq .
 
           echo ""
@@ -76,6 +85,13 @@ jobs:
 
       - name: Request OIDC token with custom audience
         run: |
+          decode_jwt_part() {
+            local PART="$1"
+            PART=$(echo "$PART" | tr '_-' '/+')
+            while [ $((${#PART} % 4)) -ne 0 ]; do PART="${PART}="; done
+            echo "$PART" | base64 -d
+          }
+
           echo "=== OIDC token with custom audience ==="
           echo "The audience claim can be set per-request, allowing a single"
           echo "token vending service to validate tokens intended for it."
@@ -86,10 +102,17 @@ jobs:
             | jq -r '.value')
 
           echo "Custom audience token claims:"
-          echo "$TOKEN_CUSTOM" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '{aud, sub, iss}'
+          decode_jwt_part "$(echo "$TOKEN_CUSTOM" | cut -d. -f2)" | jq '{aud, sub, iss}'
 
       - name: Request multiple tokens (are they unique?)
         run: |
+          decode_jwt_part() {
+            local PART="$1"
+            PART=$(echo "$PART" | tr '_-' '/+')
+            while [ $((${#PART} % 4)) -ne 0 ]; do PART="${PART}="; done
+            echo "$PART" | base64 -d
+          }
+
           echo "=== Are multiple OIDC tokens unique? ==="
           TOKEN1=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=test1" | jq -r '.value')
@@ -102,9 +125,9 @@ jobs:
           echo "Token1 (aud=test1) == Token2 (aud=test2): $([ "$TOKEN1" = "$TOKEN2" ] && echo "SAME" || echo "DIFFERENT")"
 
           echo ""
-          echo "Token1 exp: $(echo "$TOKEN1" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '.exp')"
-          echo "Token2 exp: $(echo "$TOKEN2" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '.exp')"
-          echo "Token3 exp: $(echo "$TOKEN3" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '.exp')"
+          echo "Token1 exp: $(decode_jwt_part "$(echo "$TOKEN1" | cut -d. -f2)" | jq '.exp')"
+          echo "Token2 exp: $(decode_jwt_part "$(echo "$TOKEN2" | cut -d. -f2)" | jq '.exp')"
+          echo "Token3 exp: $(decode_jwt_part "$(echo "$TOKEN3" | cut -d. -f2)" | jq '.exp')"
 
       - name: OIDC discovery document
         run: |

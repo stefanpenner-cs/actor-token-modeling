@@ -1,0 +1,108 @@
+name: Test Clone Rate Limit Impact
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-clone-rate-limit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check rate limit BEFORE clone
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== Rate limit BEFORE clone ==="
+          gh api rate_limit | jq '{
+            core: .resources.core,
+            graphql: .resources.graphql,
+            search: .resources.search
+          }'
+          echo ""
+          echo "--- Core remaining before clone ---"
+          gh api rate_limit | jq '.resources.core.remaining' | tee /tmp/before_core
+
+      - name: Clone a public repo using GITHUB_TOKEN
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Cloning with GITHUB_TOKEN via https..."
+          git clone https://x-access-token:${GITHUB_TOKEN}@github.com/stefanpenner-cs/actor-token-modeling.git /tmp/clone-test-token
+          echo "Clone with token succeeded"
+
+      - name: Check rate limit AFTER token clone
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== Rate limit AFTER token clone ==="
+          gh api rate_limit | jq '{
+            core: .resources.core,
+            graphql: .resources.graphql,
+            search: .resources.search
+          }'
+          echo ""
+          echo "--- Core remaining after token clone ---"
+          gh api rate_limit | jq '.resources.core.remaining' | tee /tmp/after_token_core
+
+      - name: Clone same repo WITHOUT token (unauthenticated)
+        run: |
+          echo "Cloning without token (unauthenticated)..."
+          git clone https://github.com/stefanpenner-cs/actor-token-modeling.git /tmp/clone-test-notoken
+          echo "Unauthenticated clone succeeded"
+
+      - name: Check rate limit AFTER unauthenticated clone
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== Rate limit AFTER unauthenticated clone ==="
+          gh api rate_limit | jq '{
+            core: .resources.core,
+            graphql: .resources.graphql,
+            search: .resources.search
+          }'
+          echo ""
+          echo "--- Core remaining after unauth clone ---"
+          gh api rate_limit | jq '.resources.core.remaining' | tee /tmp/after_unauth_core
+
+      - name: Compare results
+        run: |
+          BEFORE=$(cat /tmp/before_core)
+          AFTER_TOKEN=$(cat /tmp/after_token_core)
+          AFTER_UNAUTH=$(cat /tmp/after_unauth_core)
+
+          echo "=================================="
+          echo "  Rate Limit Impact Summary"
+          echo "=================================="
+          echo ""
+          echo "Core rate limit remaining:"
+          echo "  Before any clone:          $BEFORE"
+          echo "  After token clone:         $AFTER_TOKEN"
+          echo "  After unauthenticated clone: $AFTER_UNAUTH"
+          echo ""
+          echo "Consumed by token clone:       $((BEFORE - AFTER_TOKEN))"
+          echo "Consumed by unauth clone:      $((AFTER_TOKEN - AFTER_UNAUTH))"
+          echo "Total consumed:                $((BEFORE - AFTER_UNAUTH))"
+          echo ""
+
+          if [ "$BEFORE" -eq "$AFTER_TOKEN" ]; then
+            echo "RESULT: Token clone did NOT consume any core rate limit"
+          else
+            echo "RESULT: Token clone consumed $((BEFORE - AFTER_TOKEN)) core rate limit requests"
+          fi
+
+          if [ "$AFTER_TOKEN" -eq "$AFTER_UNAUTH" ]; then
+            echo "RESULT: Unauthenticated clone did NOT consume any core rate limit"
+          else
+            echo "RESULT: Unauthenticated clone consumed $((AFTER_TOKEN - AFTER_UNAUTH)) core rate limit requests"
+          fi
+
+      - name: Also check git-specific rate limits
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== Full rate limit dump for reference ==="
+          gh api rate_limit | jq .

@@ -30,6 +30,13 @@ jobs:
           echo "github.event_name:        $EVENT_NAME"
           echo "github.repository:        $REPO"
 
+      - name: "API: GraphQL viewer (reliable identity for installation tokens)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== GraphQL { viewer { login databaseId } } ==="
+          gh api graphql -f query='{ viewer { login databaseId } }'
+
       - name: "API: GET /user (who does the token authenticate as?)"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -41,6 +48,9 @@ jobs:
             https://api.github.com/user)
           echo "HTTP status: $HTTP_CODE"
           cat /tmp/user.json | jq '{login, id, type, name, site_admin}' 2>/dev/null || cat /tmp/user.json
+          echo ""
+          echo "Note: GET /user returns 403 for installation tokens (ghs_)."
+          echo "Use GraphQL viewer query instead."
 
       - name: "API: Response headers (token type indicators)"
         env:

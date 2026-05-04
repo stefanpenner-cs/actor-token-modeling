@@ -1,0 +1,93 @@
+name: "Probe: No Permissions Declared"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/probe-default-no-permissions.yml'
+
+# NOTE: No permissions key at all — uses repo/org default settings
+# This tests what the "default" token permissions are
+
+jobs:
+  test-default-permissions:
+    name: "What can the token do with no permissions key?"
+    runs-on: ubuntu-latest
+    steps:
+      - name: GitHub context
+        run: |
+          echo "actor: ${{ github.actor }}"
+          echo "event: ${{ github.event_name }}"
+
+      - name: "Probe default permissions"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          check() {
+            local NAME="$1"
+            local METHOD="$2"
+            local URL="$3"
+            local DATA="$4"
+
+            if [ -n "$DATA" ]; then
+              HTTP_CODE=$(curl -s -o /tmp/probe.json -w "%{http_code}" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                -X "$METHOD" -d "$DATA" "$URL")
+            else
+              HTTP_CODE=$(curl -s -o /tmp/probe.json -w "%{http_code}" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                -X "$METHOD" "$URL")
+            fi
+
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+              STATUS="GRANTED"
+            elif [ "$HTTP_CODE" = "403" ]; then
+              STATUS="DENIED"
+            elif [ "$HTTP_CODE" = "404" ]; then
+              STATUS="NOT_FOUND (may be denied or non-existent)"
+            else
+              STATUS="HTTP_$HTTP_CODE"
+            fi
+            printf "%-45s %s (HTTP %s)\n" "$NAME" "$STATUS" "$HTTP_CODE"
+          }
+
+          echo "================================================"
+          echo "  Default Permissions (no permissions: key)"
+          echo "================================================"
+          echo ""
+          echo "The org/repo default token setting controls this."
+          echo "Permissive default = read/write all."
+          echo "Restricted default = read-only (contents + metadata)."
+          echo ""
+
+          check "contents:read (list files)"        GET "https://api.github.com/repos/$REPO/contents/"
+          check "issues:read (list issues)"          GET "https://api.github.com/repos/$REPO/issues"
+          check "pull-requests:read (list PRs)"      GET "https://api.github.com/repos/$REPO/pulls"
+          check "actions:read (list runs)"           GET "https://api.github.com/repos/$REPO/actions/runs"
+          check "metadata:read (repo info)"          GET "https://api.github.com/repos/$REPO"
+
+          echo ""
+          check "contents:write (create branch)"     POST "https://api.github.com/repos/$REPO/git/refs" \
+            "{\"ref\":\"refs/heads/probe-default-deleteme\",\"sha\":\"$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/git/ref/heads/main" | jq -r '.object.sha')\"}"
+
+          # Clean up if it was created
+          curl -s -o /dev/null \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X DELETE "https://api.github.com/repos/$REPO/git/refs/heads/probe-default-deleteme" 2>/dev/null
+
+          check "issues:write (create label)"        POST "https://api.github.com/repos/$REPO/labels" \
+            '{"name":"probe-default-test","color":"000000"}'
+
+          # Clean up if it was created
+          curl -s -o /dev/null \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X DELETE "https://api.github.com/repos/$REPO/labels/probe-default-test" 2>/dev/null
+
+          check "admin (update repo)"                PATCH "https://api.github.com/repos/$REPO" \
+            '{"description":"Modeling GitHub Actions identity and ACL system"}'

@@ -1,0 +1,114 @@
+name: "Probe: Permission Escalation"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/probe-permission-escalation.yml'
+
+# Request maximum permissions — does the token actually get all of them?
+permissions: write-all
+
+jobs:
+  check-effective-permissions:
+    name: "What does write-all actually grant?"
+    runs-on: ubuntu-latest
+    steps:
+      - name: GitHub context
+        run: |
+          echo "actor: ${{ github.actor }}"
+          echo "event: ${{ github.event_name }}"
+          echo "repo: ${{ github.repository }}"
+
+      - name: "Probe each permission scope"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          check() {
+            local NAME="$1"
+            local METHOD="$2"
+            local URL="$3"
+            local DATA="$4"
+
+            if [ -n "$DATA" ]; then
+              HTTP_CODE=$(curl -s -o /tmp/probe.json -w "%{http_code}" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                -X "$METHOD" -d "$DATA" "$URL")
+            else
+              HTTP_CODE=$(curl -s -o /tmp/probe.json -w "%{http_code}" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                -X "$METHOD" "$URL")
+            fi
+
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+              STATUS="GRANTED"
+            elif [ "$HTTP_CODE" = "403" ]; then
+              STATUS="DENIED"
+            elif [ "$HTTP_CODE" = "404" ]; then
+              STATUS="NOT_FOUND (may be denied or non-existent)"
+            else
+              STATUS="HTTP_$HTTP_CODE"
+            fi
+            printf "%-45s %s (HTTP %s)\n" "$NAME" "$STATUS" "$HTTP_CODE"
+          }
+
+          echo "==========================================="
+          echo "  Effective Permissions with write-all"
+          echo "==========================================="
+          echo ""
+
+          # Read operations
+          check "contents:read (list files)"        GET "https://api.github.com/repos/$REPO/contents/"
+          check "issues:read (list issues)"          GET "https://api.github.com/repos/$REPO/issues"
+          check "pull-requests:read (list PRs)"      GET "https://api.github.com/repos/$REPO/pulls"
+          check "actions:read (list runs)"           GET "https://api.github.com/repos/$REPO/actions/runs"
+          check "packages:read (list packages)"      GET "https://api.github.com/orgs/${{ github.repository_owner }}/packages?package_type=npm"
+          check "metadata:read (repo info)"          GET "https://api.github.com/repos/$REPO"
+          check "security:read (alerts)"             GET "https://api.github.com/repos/$REPO/vulnerability-alerts"
+
+          echo ""
+          # Write operations (using safe/reversible mutations)
+          check "issues:write (create label)"        POST "https://api.github.com/repos/$REPO/labels" \
+            '{"name":"probe-test-delete-me","color":"000000"}'
+
+          # Clean up label
+          curl -s -o /dev/null \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X DELETE "https://api.github.com/repos/$REPO/labels/probe-test-delete-me"
+
+          check "contents:write (create ref)"        POST "https://api.github.com/repos/$REPO/git/refs" \
+            "{\"ref\":\"refs/heads/probe-test-deleteme\",\"sha\":\"$(gh api repos/$REPO/git/ref/heads/main --jq '.object.sha')\"}"
+
+          # Clean up branch
+          curl -s -o /dev/null \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X DELETE "https://api.github.com/repos/$REPO/git/refs/heads/probe-test-deleteme"
+
+          echo ""
+          # Admin operations
+          check "admin (update repo description)"    PATCH "https://api.github.com/repos/$REPO" \
+            '{"description":"Modeling GitHub Actions identity and ACL system"}'
+
+      - name: "Check /installation/repositories scope"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== /installation/repositories (what repos can this token see?) ==="
+          HTTP_CODE=$(curl -s -o /tmp/repos.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/installation/repositories?per_page=5")
+          echo "HTTP $HTTP_CODE"
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Token can see these repos via installation endpoint:"
+            jq '[.repositories[] | .full_name]' /tmp/repos.json
+            echo "Total: $(jq '.total_count' /tmp/repos.json)"
+          else
+            jq . /tmp/repos.json 2>/dev/null || cat /tmp/repos.json
+          fi

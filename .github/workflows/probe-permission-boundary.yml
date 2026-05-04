@@ -1,0 +1,170 @@
+name: "Probe: Permission Boundaries"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/probe-permission-boundary.yml'
+
+# Deliberately request a mix of permissions to test boundaries
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+  # NOT requesting: actions, packages, deployments, etc.
+
+jobs:
+  test-granted-permissions:
+    name: "Test operations within declared permissions"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "contents:read — list repo contents (should succeed)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== GET /repos/:repo/contents (contents: read) ==="
+          HTTP_CODE=$(curl -s -o /tmp/contents.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/")
+          echo "HTTP $HTTP_CODE — $([ "$HTTP_CODE" = "200" ] && echo "ALLOWED" || echo "DENIED")"
+
+      - name: "issues:write — create an issue (should succeed)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== POST /repos/:repo/issues (issues: write) ==="
+          HTTP_CODE=$(curl -s -o /tmp/issue.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST \
+            -d '{"title":"[probe] permission boundary test — auto-close","body":"Automated test from probe-permission-boundary workflow. This issue will be closed immediately.","labels":["automated-test"]}' \
+            "https://api.github.com/repos/${{ github.repository }}/issues")
+          echo "HTTP $HTTP_CODE — $([ "$HTTP_CODE" = "201" ] && echo "ALLOWED" || echo "DENIED")"
+          if [ "$HTTP_CODE" = "201" ]; then
+            ISSUE_NUM=$(jq '.number' /tmp/issue.json)
+            echo "Created issue #$ISSUE_NUM — closing it now..."
+            curl -s -o /dev/null -w "Close HTTP %{http_code}\n" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -X PATCH \
+              -d '{"state":"closed"}' \
+              "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUM"
+          fi
+
+      - name: "pull-requests:read — list PRs (should succeed)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== GET /repos/:repo/pulls (pull-requests: read) ==="
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls")
+          echo "HTTP $HTTP_CODE — $([ "$HTTP_CODE" = "200" ] && echo "ALLOWED" || echo "DENIED")"
+
+  test-undeclared-permissions:
+    name: "Test operations NOT declared in permissions"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "contents:write — try to create a file (should FAIL)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== PUT /repos/:repo/contents/:path (contents: write — NOT declared) ==="
+          HTTP_CODE=$(curl -s -o /tmp/create.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X PUT \
+            -d "{\"message\":\"probe test\",\"content\":\"$(echo 'test' | base64)\"}" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/probe-test-deleteme.txt")
+          echo "HTTP $HTTP_CODE — $([ "$HTTP_CODE" = "201" ] && echo "ALLOWED (unexpected!)" || echo "DENIED (expected)")"
+          jq '{message: .message, documentation_url: .documentation_url}' /tmp/create.json 2>/dev/null || cat /tmp/create.json
+
+      - name: "actions:write — try to delete a workflow run (should FAIL)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== DELETE /repos/:repo/actions/runs/:id (actions: write — NOT declared) ==="
+          # Use a fake run ID — we're testing the auth rejection, not the 404
+          HTTP_CODE=$(curl -s -o /tmp/actions.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X DELETE \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/1")
+          echo "HTTP $HTTP_CODE — $([ "$HTTP_CODE" = "403" ] && echo "DENIED (expected)" || echo "Got $HTTP_CODE")"
+          jq '{message: .message}' /tmp/actions.json 2>/dev/null || cat /tmp/actions.json
+
+      - name: "admin — try to update repo settings (should FAIL)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== PATCH /repos/:repo (admin — NOT declared) ==="
+          HTTP_CODE=$(curl -s -o /tmp/admin.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X PATCH \
+            -d '{"description":"probe test — should be denied"}' \
+            "https://api.github.com/repos/${{ github.repository }}")
+          echo "HTTP $HTTP_CODE — $([ "$HTTP_CODE" = "403" ] && echo "DENIED (expected)" || echo "Got $HTTP_CODE")"
+          jq '{message: .message}' /tmp/admin.json 2>/dev/null || cat /tmp/admin.json
+
+      - name: "packages:read — try to list packages (should FAIL)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== GET /orgs/:org/packages (packages: read — NOT declared) ==="
+          HTTP_CODE=$(curl -s -o /tmp/packages.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/orgs/${{ github.repository_owner }}/packages?package_type=npm")
+          echo "HTTP $HTTP_CODE — $([ "$HTTP_CODE" = "200" ] && echo "ALLOWED (unexpected!)" || echo "DENIED (expected)")"
+          jq '{message: .message}' /tmp/packages.json 2>/dev/null || cat /tmp/packages.json
+
+  test-cross-repo:
+    name: "Test cross-repo access (should be denied)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Try to read a different repo's contents"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== GET /repos/stefanpenner/ember-cli/contents (cross-repo) ==="
+          HTTP_CODE=$(curl -s -o /tmp/cross.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/stefanpenner/ember-cli/contents/")
+          echo "HTTP $HTTP_CODE"
+          echo ""
+          echo "Note: GITHUB_TOKEN is scoped to the repository where the workflow runs."
+          echo "Cross-repo access to PUBLIC repos may succeed (read-only, like unauthenticated),"
+          echo "but cross-repo access to PRIVATE repos should always fail."
+
+      - name: "Compare: same request without token"
+        run: |
+          echo "=== GET /repos/stefanpenner/ember-cli/contents (no auth) ==="
+          HTTP_CODE=$(curl -s -o /tmp/cross_noauth.json -w "%{http_code}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/stefanpenner/ember-cli/contents/")
+          echo "HTTP $HTTP_CODE"
+          echo ""
+          echo "If both return 200, the token isn't granting extra cross-repo access."
+
+  summary:
+    name: "Summary"
+    needs: [test-granted-permissions, test-undeclared-permissions, test-cross-repo]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "=================================="
+          echo "  Permission Boundary Probe Done"
+          echo "=================================="
+          echo ""
+          echo "Check the individual job logs above for detailed results."
+          echo ""
+          echo "Expected behavior:"
+          echo "  - Declared permissions (contents:read, issues:write, pull-requests:read) → ALLOWED"
+          echo "  - Undeclared permissions (contents:write, actions:write, admin, packages) → DENIED"
+          echo "  - Cross-repo access → same as unauthenticated (public repos readable, private denied)"

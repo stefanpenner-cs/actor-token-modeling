@@ -1,0 +1,114 @@
+name: "Probe: Token Identity"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/probe-token-identity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  token-identity:
+    runs-on: ubuntu-latest
+    steps:
+      - name: GitHub context — actor fields
+        env:
+          ACTOR: ${{ github.actor }}
+          ACTOR_ID: ${{ github.actor_id }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          TOKEN_PERMISSIONS: ${{ toJSON(github.token) }}
+        run: |
+          echo "=== GitHub Context ==="
+          echo "github.actor:             $ACTOR"
+          echo "github.actor_id:          $ACTOR_ID"
+          echo "github.triggering_actor:  $TRIGGERING_ACTOR"
+          echo "github.event_name:        $EVENT_NAME"
+          echo "github.repository:        $REPO"
+
+      - name: "API: GET /user (who does the token authenticate as?)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== GET /user ==="
+          HTTP_CODE=$(curl -s -o /tmp/user.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/user)
+          echo "HTTP status: $HTTP_CODE"
+          cat /tmp/user.json | jq '{login, id, type, name, site_admin}' 2>/dev/null || cat /tmp/user.json
+
+      - name: "API: Response headers (token type indicators)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== Response headers from GET /user ==="
+          curl -s -I \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/user 2>&1 | grep -iE "(x-oauth|x-github|x-ratelimit|token|scope|accepted)" || echo "(no matching headers)"
+
+          echo ""
+          echo "=== Response headers from GET /repos ==="
+          curl -s -I \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}" 2>&1 | grep -iE "(x-oauth|x-github|x-ratelimit|token|scope|accepted)" || echo "(no matching headers)"
+
+      - name: "API: GET /repos/:repo (check repo permission grant)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== GET /repos/${{ github.repository }} ==="
+          gh api "repos/${{ github.repository }}" --jq '{
+            full_name,
+            permissions: .permissions,
+            private,
+            visibility
+          }'
+
+      - name: "API: GET /repos/:repo/collaborators/:actor/permission"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== Collaborator permission for actor: ${{ github.actor }} ==="
+          HTTP_CODE=$(curl -s -o /tmp/collab.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission")
+          echo "HTTP status: $HTTP_CODE"
+          cat /tmp/collab.json | jq '{permission, role_name, user: {login: .user.login, type: .user.type}}' 2>/dev/null || cat /tmp/collab.json
+
+      - name: "API: GET /installation/repositories (is this an app token?)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== GET /installation/repositories ==="
+          HTTP_CODE=$(curl -s -o /tmp/install.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/installation/repositories)
+          echo "HTTP status: $HTTP_CODE"
+          if [ "$HTTP_CODE" = "200" ]; then
+            cat /tmp/install.json | jq '{total_count, repositories: [.repositories[] | {full_name, permissions}]}'
+          else
+            cat /tmp/install.json | jq . 2>/dev/null || cat /tmp/install.json
+          fi
+
+      - name: "API: Token rate limit category"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== Rate limit (reveals token category by limits) ==="
+          gh api rate_limit --jq '{
+            core_limit: .resources.core.limit,
+            graphql_limit: .resources.graphql.limit,
+            search_limit: .resources.search.limit
+          }'
+          echo ""
+          echo "Note: PATs get 5000 core, unauthenticated gets 60,"
+          echo "GitHub App installations get 5000 (or 15000 for GitHub Enterprise)."

@@ -1,0 +1,118 @@
+name: "Probe: OIDC Token Claims"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/probe-oidc-token.yml'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  inspect-oidc-token:
+    name: "Decode and inspect the OIDC token"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request OIDC token from GitHub
+        id: oidc
+        run: |
+          echo "=== Requesting OIDC token from GitHub's token endpoint ==="
+          OIDC_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://github.com/stefanpenner-cs" \
+            | jq -r '.value')
+          echo "Token length: ${#OIDC_TOKEN}"
+          echo "Token prefix: ${OIDC_TOKEN:0:20}..."
+          # Store for later steps (mask it in logs)
+          echo "::add-mask::$OIDC_TOKEN"
+          echo "token=$OIDC_TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Decode OIDC token header
+        env:
+          TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          echo "=== JWT Header ==="
+          echo "$TOKEN" | cut -d. -f1 | base64 -d 2>/dev/null | jq .
+
+      - name: Decode OIDC token claims (payload)
+        env:
+          TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          echo "=== JWT Claims (full payload) ==="
+          # JWT base64url needs padding normalization
+          PAYLOAD=$(echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null)
+          echo "$PAYLOAD" | jq .
+
+          echo ""
+          echo "=== Key claims for policy decisions ==="
+          echo "$PAYLOAD" | jq '{
+            sub,
+            aud,
+            iss,
+            repository,
+            repository_owner,
+            repository_owner_id,
+            actor,
+            actor_id,
+            workflow,
+            workflow_ref,
+            job_workflow_ref,
+            event_name,
+            ref,
+            ref_type,
+            sha,
+            environment,
+            runner_environment,
+            repository_visibility,
+            run_id,
+            run_number,
+            run_attempt,
+            iat,
+            exp,
+            nbf
+          }'
+
+      - name: Request OIDC token with custom audience
+        run: |
+          echo "=== OIDC token with custom audience ==="
+          echo "The audience claim can be set per-request, allowing a single"
+          echo "token vending service to validate tokens intended for it."
+          echo ""
+
+          TOKEN_CUSTOM=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://token-vending.example.com" \
+            | jq -r '.value')
+
+          echo "Custom audience token claims:"
+          echo "$TOKEN_CUSTOM" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '{aud, sub, iss}'
+
+      - name: Request multiple tokens (are they unique?)
+        run: |
+          echo "=== Are multiple OIDC tokens unique? ==="
+          TOKEN1=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=test1" | jq -r '.value')
+          TOKEN2=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=test2" | jq -r '.value')
+          TOKEN3=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=test1" | jq -r '.value')
+
+          echo "Token1 (aud=test1) == Token3 (aud=test1): $([ "$TOKEN1" = "$TOKEN3" ] && echo "SAME" || echo "DIFFERENT")"
+          echo "Token1 (aud=test1) == Token2 (aud=test2): $([ "$TOKEN1" = "$TOKEN2" ] && echo "SAME" || echo "DIFFERENT")"
+
+          echo ""
+          echo "Token1 exp: $(echo "$TOKEN1" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '.exp')"
+          echo "Token2 exp: $(echo "$TOKEN2" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '.exp')"
+          echo "Token3 exp: $(echo "$TOKEN3" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '.exp')"
+
+      - name: OIDC discovery document
+        run: |
+          echo "=== OIDC Discovery (/.well-known/openid-configuration) ==="
+          curl -s https://token.actions.githubusercontent.com/.well-known/openid-configuration | jq .
+
+          echo ""
+          echo "=== JWKS (public keys for token verification) ==="
+          JWKS_URI=$(curl -s https://token.actions.githubusercontent.com/.well-known/openid-configuration | jq -r '.jwks_uri')
+          curl -s "$JWKS_URI" | jq '.keys | length' | xargs -I{} echo "Number of signing keys: {}"
+          curl -s "$JWKS_URI" | jq '.keys[] | {kid, kty, alg}'

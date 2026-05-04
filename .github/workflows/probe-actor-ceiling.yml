@@ -1,0 +1,136 @@
+name: "Probe: Actor Permission Ceiling"
+
+# This workflow tests whether the YAML permissions: key can exceed
+# the triggering actor's own permissions on the repository.
+#
+# To test: add a collaborator with "read" permission, have them
+# trigger this workflow via workflow_dispatch, and compare results
+# to when an admin triggers it.
+
+on:
+  workflow_dispatch:
+
+# Request maximum permissions — if actor ceiling applies,
+# a read-only collaborator should still be denied write operations
+permissions: write-all
+
+jobs:
+  probe-actor-ceiling:
+    name: "Test effective permissions for actor: ${{ github.actor }}"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Context
+        run: |
+          echo "=== Actor Context ==="
+          echo "github.actor:            ${{ github.actor }}"
+          echo "github.actor_id:         ${{ github.actor_id }}"
+          echo "github.triggering_actor: ${{ github.triggering_actor }}"
+          echo "github.event_name:       ${{ github.event_name }}"
+
+      - name: "Check actor's repo permission"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== Actor's permission on this repo ==="
+          # This may fail if the token doesn't have admin/write permissions
+          HTTP_CODE=$(curl -s -o /tmp/perm.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission")
+          echo "HTTP $HTTP_CODE"
+          if [ "$HTTP_CODE" = "200" ]; then
+            jq '{permission, role_name}' /tmp/perm.json
+          else
+            echo "Could not check (may lack permission to query collaborators)"
+            jq . /tmp/perm.json 2>/dev/null
+          fi
+
+      - name: "Runner-reported token permissions"
+        run: |
+          echo "=== Token permissions (from runner setup) ==="
+          echo "Check the 'Set up job' step above for GITHUB_TOKEN Permissions"
+
+      - name: "Probe effective permissions"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          check() {
+            local NAME="$1"
+            local METHOD="$2"
+            local URL="$3"
+            local DATA="$4"
+
+            if [ -n "$DATA" ]; then
+              HTTP_CODE=$(curl -s -o /tmp/probe.json -w "%{http_code}" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                -X "$METHOD" -d "$DATA" "$URL")
+            else
+              HTTP_CODE=$(curl -s -o /tmp/probe.json -w "%{http_code}" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                -X "$METHOD" "$URL")
+            fi
+
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+              STATUS="GRANTED"
+            elif [ "$HTTP_CODE" = "403" ]; then
+              STATUS="DENIED"
+            elif [ "$HTTP_CODE" = "404" ]; then
+              STATUS="NOT_FOUND"
+            else
+              STATUS="HTTP_$HTTP_CODE"
+            fi
+            printf "%-45s %s (HTTP %s)\n" "$NAME" "$STATUS" "$HTTP_CODE"
+          }
+
+          echo "=============================================="
+          echo "  Effective permissions for: ${{ github.actor }}"
+          echo "  Declared: write-all"
+          echo "=============================================="
+          echo ""
+
+          # Read operations
+          check "contents:read (list files)"        GET "https://api.github.com/repos/$REPO/contents/"
+          check "issues:read (list issues)"          GET "https://api.github.com/repos/$REPO/issues"
+          check "actions:read (list runs)"           GET "https://api.github.com/repos/$REPO/actions/runs"
+
+          echo ""
+          # Write operations
+          check "issues:write (create label)"        POST "https://api.github.com/repos/$REPO/labels" \
+            '{"name":"actor-ceiling-test","color":"ff0000"}'
+
+          # Clean up
+          curl -s -o /dev/null \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X DELETE "https://api.github.com/repos/$REPO/labels/actor-ceiling-test" 2>/dev/null
+
+          SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/ref/heads/main" | jq -r '.object.sha')
+          check "contents:write (create branch)"     POST "https://api.github.com/repos/$REPO/git/refs" \
+            "{\"ref\":\"refs/heads/actor-ceiling-test\",\"sha\":\"$SHA\"}"
+
+          # Clean up
+          curl -s -o /dev/null \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X DELETE "https://api.github.com/repos/$REPO/git/refs/heads/actor-ceiling-test" 2>/dev/null
+
+          echo ""
+          # Admin operations
+          check "admin (update repo)"                PATCH "https://api.github.com/repos/$REPO" \
+            '{"description":"Modeling GitHub Actions identity and ACL system"}'
+
+      - name: "Summary"
+        run: |
+          echo ""
+          echo "=== How to interpret ==="
+          echo "Compare this output across different actors:"
+          echo "  - Admin actor → expect write-all to be fully effective"
+          echo "  - Read-only actor → expect writes to be DENIED despite write-all declaration"
+          echo ""
+          echo "If a read-only actor gets the same GRANTED results as admin,"
+          echo "then permissions: can escalate beyond the actor's access (a security concern)."
+          echo "If writes are DENIED for read-only, the actor ceiling is enforced."
